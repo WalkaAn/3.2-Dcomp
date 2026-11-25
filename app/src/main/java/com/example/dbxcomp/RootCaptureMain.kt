@@ -4,6 +4,7 @@ import android.media.AudioFormat
 import android.media.AudioRecord
 import android.os.Looper
 import java.io.FileDescriptor
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import kotlin.math.abs
 import kotlin.math.max
@@ -19,11 +20,20 @@ import kotlin.system.exitProcess
  * perekam REMOTE_SUBMIX di sebagian HP macet atau tidak menerima suara baru. Karena itu perekam
  * dibuat ulang bila (a) senyap terus-menerus beberapa saat, (b) read mengembalikan 0 / error,
  * atau (c) read tidak kembali sama sekali (dijaga thread pengawas).
+ *
+ * v3.3: selama perekam macet, suara asli pemutar bocor langsung ke speaker/headset (inilah
+ * "hentakan" di awal lagu). Supaya jendela bocor sependek mungkin, aplikasi memberi kabar lewat
+ * stdin (satu byte) setiap jumlah pemutar suara di HP berubah. Selama [QUICK_WINDOW_MS] sesudah
+ * kabar itu, batas senyap/nol dipendekkan jadi [QUICK_SILENT_MS]/[QUICK_ZERO_MS]. Di luar jendela
+ * itu batas biasa dipakai sebagai cadangan.
  */
 object RootCaptureMain {
     private const val SOURCE_REMOTE_SUBMIX = 8  // MediaRecorder.AudioSource.REMOTE_SUBMIX (hidden)
-    private const val SILENT_REFRESH_MS = 150L   // senyap selama ini -> buat ulang perekam
-    private const val ZERO_REFRESH_MS = 200L     // read terus 0 selama ini -> buat ulang
+    private const val SILENT_REFRESH_MS = 200L   // cadangan: senyap selama ini -> buat ulang perekam
+    private const val ZERO_REFRESH_MS = 300L     // cadangan: read terus 0 selama ini -> buat ulang
+    private const val QUICK_SILENT_MS = 80L      // jendela cepat: senyap selama ini -> buat ulang
+    private const val QUICK_ZERO_MS = 100L       // jendela cepat: read terus 0 selama ini
+    private const val QUICK_WINDOW_MS = 2000L    // lama jendela cepat sesudah kabar dari aplikasi
     private const val STALL_MS = 1500L           // read tidak kembali selama ini -> pengawas turun tangan
     private const val SILENCE_LEVEL = 8          // |sampel| <= 8 (dari 32768) dianggap senyap
 
@@ -32,6 +42,10 @@ object RootCaptureMain {
 
     @Volatile
     private var lastReturnMs = 0L
+
+    // Waktu (ms) sampai kapan jendela cepat berlaku; diatur oleh kabar dari aplikasi lewat stdin.
+    @Volatile
+    private var quickUntilMs = 0L
 
     private fun openRecord(rate: Int, bytes: Int): AudioRecord? {
         return try {
@@ -126,8 +140,24 @@ object RootCaptureMain {
             }
         }.also { it.isDaemon = true; it.start() }
 
+        // Kabar dari aplikasi lewat stdin: tiap byte = "jumlah pemutar suara di HP berubah".
+        // Buka jendela cepat. Kalau stdin tidak tersambung (EOF) thread ini selesai diam-diam
+        // dan helper tetap jalan dengan batas biasa.
+        Thread {
+            try {
+                val input = FileInputStream(FileDescriptor.`in`)
+                while (true) {
+                    val c = input.read()
+                    if (c < 0) return@Thread
+                    quickUntilMs = System.currentTimeMillis() + QUICK_WINDOW_MS
+                }
+            } catch (_: Throwable) {
+            }
+        }.also { it.isDaemon = true; it.start() }
+
         val buf = ByteArray(rate / 100 * 4)  // ~10 ms stereo 16-bit
         val silentLimitBytes = rate.toLong() * 4 * SILENT_REFRESH_MS / 1000
+        val quickLimitBytes = rate.toLong() * 4 * QUICK_SILENT_MS / 1000
         var silentBytes = 0L
         var zeroSince = 0L
         var openFails = 0
@@ -157,9 +187,11 @@ object RootCaptureMain {
                     readErrors = 0
                     if (isSilent(buf, n)) {
                         silentBytes += n
-                        if (silentBytes >= silentLimitBytes) {
+                        val limit =
+                            if (lastReturnMs < quickUntilMs) quickLimitBytes else silentLimitBytes
+                        if (silentBytes >= limit) {
                             silentBytes = 0L
-                            reopen()  // senyap lama: segarkan, siapa tahu sesi lama sudah mati
+                            reopen()  // senyap: segarkan, siapa tahu sesi lama sudah mati
                         }
                     } else {
                         silentBytes = 0L
@@ -167,7 +199,8 @@ object RootCaptureMain {
                 } else if (n == 0) {
                     val now = System.currentTimeMillis()
                     if (zeroSince == 0L) zeroSince = now
-                    if (now - zeroSince >= ZERO_REFRESH_MS) {
+                    val zeroLimit = if (now < quickUntilMs) QUICK_ZERO_MS else ZERO_REFRESH_MS
+                    if (now - zeroSince >= zeroLimit) {
                         zeroSince = 0L
                         reopen()
                     } else {
