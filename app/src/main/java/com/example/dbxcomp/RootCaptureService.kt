@@ -1,196 +1,227 @@
 package com.example.dbxcomp
 
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.PendingIntent
-import android.app.Service
-import android.content.Intent
-import android.content.pm.ServiceInfo
-import android.os.Build
-import android.os.Handler
-import android.os.IBinder
+import android.media.AudioFormat
+import android.media.AudioRecord
 import android.os.Looper
-import android.os.Process
-import android.util.Log
-import java.io.EOFException
+import java.io.FileDescriptor
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.system.exitProcess
 
 /**
- * Sumber "suara internal ROOT": menjalankan [RootCaptureMain] sebagai root, membaca PCM 16-bit
- * stereo dari stdout-nya, lalu mendorongnya ke mesin native. Tidak memakai MediaProjection,
- * jadi aplikasi yang menolak AudioPlaybackCapture (Spotify, dll) tetap bisa masuk.
- * Berjalan sebagai layanan foreground agar tetap hidup di latar belakang.
+ * Helper yang dijalankan sebagai ROOT lewat `su -c app_process ...` (BUKAN di dalam aplikasi).
+ * Merekam campuran semua suara keluaran HP (AudioSource.REMOTE_SUBMIX) lalu menulis PCM 16-bit
+ * stereo little-endian mentah ke stdout. Aplikasi membaca stdout itu di [RootCaptureService].
+ * Pesan error ditulis ke stderr dengan awalan "ERR:".
+ *
+ * Pemulihan: saat pemutar (mis. YouTube) pause atau ganti video, sesi audionya ditutup dan
+ * perekam REMOTE_SUBMIX di sebagian HP macet atau tidak menerima suara baru. Karena itu perekam
+ * dibuat ulang bila (a) senyap terus-menerus beberapa saat, (b) read mengembalikan 0 / error,
+ * atau (c) read tidak kembali sama sekali (dijaga thread pengawas).
+ *
+ * v3.3: selama perekam macet, suara asli pemutar bocor langsung ke speaker/headset (inilah
+ * "hentakan" di awal lagu). Supaya jendela bocor sependek mungkin, aplikasi memberi kabar lewat
+ * stdin (satu byte) setiap jumlah pemutar suara di HP berubah. Selama [QUICK_WINDOW_MS] sesudah
+ * kabar itu, batas senyap/nol dipendekkan jadi [QUICK_SILENT_MS]/[QUICK_ZERO_MS]. Di luar jendela
+ * itu batas biasa dipakai sebagai cadangan.
  */
-class RootCaptureService : Service() {
-
-    companion object {
-        private const val HELPER_CLASS = "com.example.dbxcomp.RootCaptureMain"
-        private const val CHANNEL_ID = "dbxcomp_root"
-        private const val NOTIF_ID = 3
-    }
-
-    private val main = Handler(Looper.getMainLooper())
-    private var proc: java.lang.Process? = null
-    private var thread: Thread? = null
-    private val errText = StringBuffer()
+object RootCaptureMain {
+    private const val SOURCE_REMOTE_SUBMIX = 8  // MediaRecorder.AudioSource.REMOTE_SUBMIX (hidden)
+    private const val SILENT_REFRESH_MS = 200L   // cadangan: senyap selama ini -> buat ulang perekam
+    private const val ZERO_REFRESH_MS = 300L     // cadangan: read terus 0 selama ini -> buat ulang
+    private const val QUICK_SILENT_MS = 80L      // jendela cepat: senyap selama ini -> buat ulang
+    private const val QUICK_ZERO_MS = 100L       // jendela cepat: read terus 0 selama ini
+    private const val QUICK_WINDOW_MS = 2000L    // lama jendela cepat sesudah kabar dari aplikasi
+    private const val STALL_MS = 1500L           // read tidak kembali selama ini -> pengawas turun tangan
+    private const val SILENCE_LEVEL = 8          // |sampel| <= 8 (dari 32768) dianggap senyap
 
     @Volatile
-    private var running = false
-    private var retries = 0
+    private var rec: AudioRecord? = null
 
-    override fun onBind(intent: Intent?): IBinder? = null
+    @Volatile
+    private var lastReturnMs = 0L
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent == null) {
-            stopSelf()
-            return START_NOT_STICKY
-        }
-        startForegroundCompat()
-        val rate = intent.getIntExtra(CaptureService.EXTRA_RATE, 48000)
-        val err = begin(rate)
-        if (err != null) {
-            Log.e("DbxComp", err)
-            report(err)
-            stopSelf()
-        }
-        return START_NOT_STICKY
-    }
+    // Waktu (ms) sampai kapan jendela cepat berlaku; diatur oleh kabar dari aplikasi lewat stdin.
+    @Volatile
+    private var quickUntilMs = 0L
 
-    private fun startForegroundCompat() {
-        val nm = getSystemService(NotificationManager::class.java)
-        val builder: Notification.Builder
-        if (Build.VERSION.SDK_INT >= 26) {
-            nm.createNotificationChannel(
-                NotificationChannel(CHANNEL_ID, "Suara internal (root)", NotificationManager.IMPORTANCE_LOW)
+    private fun openRecord(rate: Int, bytes: Int): AudioRecord? {
+        return try {
+            val r = AudioRecord(
+                SOURCE_REMOTE_SUBMIX, rate, AudioFormat.CHANNEL_IN_STEREO,
+                AudioFormat.ENCODING_PCM_16BIT, bytes
             )
-            builder = Notification.Builder(this, CHANNEL_ID)
-        } else {
-            @Suppress("DEPRECATION")
-            builder = Notification.Builder(this)
+            if (r.state != AudioRecord.STATE_INITIALIZED) {
+                r.release()
+                null
+            } else {
+                r.startRecording()
+                r
+            }
+        } catch (_: Throwable) {
+            null
         }
-        val open = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+    }
+
+    private fun closeRecord(r: AudioRecord?) {
+        try {
+            r?.stop()
+        } catch (_: Throwable) {
+        }
+        try {
+            r?.release()
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun isSilent(buf: ByteArray, n: Int): Boolean {
+        var i = 0
+        while (i + 1 < n) {
+            val s = (buf[i + 1].toInt() shl 8) or (buf[i].toInt() and 0xff)
+            if (abs(s.toShort().toInt()) > SILENCE_LEVEL) return false
+            i += 2
+        }
+        return true
+    }
+
+    @JvmStatic
+    fun main(args: Array<String>) {
+        val rate = args.getOrNull(0)?.toIntOrNull() ?: 48000
+        try {
+            Looper.prepareMainLooper()
+        } catch (_: Throwable) {
+        }
+
+        // FileOutputStream (bukan System.out) supaya error pipa putus benar-benar dilempar.
+        val out = FileOutputStream(FileDescriptor.out)
+        val minBytes = AudioRecord.getMinBufferSize(
+            rate, AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT
         )
-        val n = builder
-            .setContentTitle("DbxComp")
-            .setContentText("Memproses suara internal HP (root)")
-            .setSmallIcon(R.drawable.ic_stat_dbxcomp)
-            .setContentIntent(open)
-            .setOngoing(true)
-            .build()
-        if (Build.VERSION.SDK_INT >= 29) {
-            startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
-        } else {
-            startForeground(NOTIF_ID, n)
+        val bytes = max(minBytes, rate / 10 * 4)  // >= 100 ms
+
+        val first = try {
+            AudioRecord(
+                SOURCE_REMOTE_SUBMIX, rate, AudioFormat.CHANNEL_IN_STEREO,
+                AudioFormat.ENCODING_PCM_16BIT, bytes
+            )
+        } catch (e: Throwable) {
+            System.err.println("ERR:REMOTE_SUBMIX gagal dibuat: $e")
+            exitProcess(2)
         }
-    }
-
-    /** Mengembalikan pesan error, atau null kalau helper root sudah berjalan. */
-    private fun begin(rate: Int): String? {
-        val apk = packageCodePath
-        val cmd = "CLASSPATH='$apk' exec app_process /system/bin $HELPER_CLASS $rate"
-        val p = try {
-            ProcessBuilder("su", "-c", cmd).start()
-        } catch (e: Exception) {
-            Log.e("DbxComp", "su gagal dijalankan", e)
-            return "Root (su) tidak tersedia: ${e.message}"
+        if (first.state != AudioRecord.STATE_INITIALIZED) {
+            System.err.println("ERR:REMOTE_SUBMIX tidak siap (ditolak sistem/pabrikan HP)")
+            exitProcess(3)
         }
-        proc = p
-        running = true
-
-        Thread {
-            try {
-                p.errorStream.bufferedReader().forEachLine {
-                    Log.w("DbxComp", "root helper: $it")
-                    if (errText.length < 2000) errText.append(it).append('\n')
-                }
-            } catch (_: Exception) {
-            }
-        }.also { it.isDaemon = true; it.start() }
-
-        thread = Thread { readLoop(p, rate) }.also { it.start() }
-        return null
-    }
-
-    private fun readLoop(p: java.lang.Process, rate: Int) {
-        Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
-        val input = p.inputStream
-        val bytes = ByteArray(rate / 100 * 4)      // ~10 ms stereo 16-bit
-        val buf = FloatArray(rate / 100 * 2)       // stereo float interleaved
         try {
-            while (running) {
-                var off = 0
-                while (off < bytes.size) {
-                    val n = input.read(bytes, off, bytes.size - off)
-                    if (n < 0) throw EOFException()
-                    off += n
+            first.startRecording()
+        } catch (e: Throwable) {
+            System.err.println("ERR:startRecording gagal: $e")
+            exitProcess(4)
+        }
+        rec = first
+        lastReturnMs = System.currentTimeMillis()
+
+        // Pengawas: kalau read macet total (tidak kembali), hentikan perekam supaya read lepas.
+        Thread {
+            while (true) {
+                try {
+                    Thread.sleep(500)
+                } catch (_: InterruptedException) {
+                    return@Thread
                 }
-                retries = 0  // data mengalir lagi: hitungan percobaan ulang dimulai dari nol
-                var i = 0
-                for (j in buf.indices) {
-                    val s = (bytes[i + 1].toInt() shl 8) or (bytes[i].toInt() and 0xff)
-                    buf[j] = s / 32768f
-                    i += 2
-                }
-                AudioEngine.nativePushCapture(2, buf, buf.size)
-            }
-        } catch (e: Exception) {
-            if (running && retries < 3) {
-                // Helper root mati sendiri (mis. dibunuh sistem di latar belakang): jalankan ulang.
-                retries++
-                Log.w("DbxComp", "Helper root berhenti, mencoba ulang ($retries)", e)
-                main.postDelayed({
-                    if (running) {
-                        try {
-                            proc?.destroy()
-                        } catch (_: Exception) {
-                        }
-                        errText.setLength(0)
-                        val err = begin(rate)
-                        if (err != null) {
-                            report(err)
-                            stopSelf()
-                        }
+                if (System.currentTimeMillis() - lastReturnMs > STALL_MS) {
+                    try {
+                        rec?.stop()
+                    } catch (_: Throwable) {
                     }
-                }, 400)
-            } else if (running) {
-                Thread.sleep(150)  // beri waktu thread stderr menangkap pesan
-                val detail = errText.toString().trim()
-                val msg = when {
-                    detail.contains("ERR:") -> "Helper root gagal: " + detail.substringAfter("ERR:").lineSequence().first()
-                    detail.isNotEmpty() -> "Helper root berhenti: " + detail.lineSequence().first()
-                    else -> "Helper root berhenti (izin root ditolak atau tidak ada)"
                 }
-                Log.e("DbxComp", msg, e)
-                report(msg)
-                main.post { stopSelf() }
-            }
-        }
-    }
-
-    private fun report(msg: String) {
-        main.post { CaptureService.listener?.invoke(msg) }
-    }
-
-    override fun onDestroy() {
-        running = false
-        try {
-            proc?.destroy()
-        } catch (_: Exception) {
-        }
-        proc = null
-        // Cadangan: pastikan helper root benar-benar mati.
-        Thread {
-            try {
-                ProcessBuilder("su", "-c", "pkill -f $HELPER_CLASS").start().waitFor()
-            } catch (_: Exception) {
             }
         }.also { it.isDaemon = true; it.start() }
-        try {
-            thread?.join(500)
-        } catch (_: InterruptedException) {
+
+        // Kabar dari aplikasi lewat stdin: tiap byte = "jumlah pemutar suara di HP berubah".
+        // Buka jendela cepat. Kalau stdin tidak tersambung (EOF) thread ini selesai diam-diam
+        // dan helper tetap jalan dengan batas biasa.
+        Thread {
+            try {
+                val input = FileInputStream(FileDescriptor.`in`)
+                while (true) {
+                    val c = input.read()
+                    if (c < 0) return@Thread
+                    quickUntilMs = System.currentTimeMillis() + QUICK_WINDOW_MS
+                }
+            } catch (_: Throwable) {
+            }
+        }.also { it.isDaemon = true; it.start() }
+
+        val buf = ByteArray(rate / 100 * 4)  // ~10 ms stereo 16-bit
+        val silentLimitBytes = rate.toLong() * 4 * SILENT_REFRESH_MS / 1000
+        val quickLimitBytes = rate.toLong() * 4 * QUICK_SILENT_MS / 1000
+        var silentBytes = 0L
+        var zeroSince = 0L
+        var openFails = 0
+        var readErrors = 0
+
+        fun reopen() {
+            closeRecord(rec)
+            rec = null
+            val r = openRecord(rate, bytes)
+            if (r != null) {
+                rec = r
+                openFails = 0
+            } else {
+                openFails++
+            }
+            lastReturnMs = System.currentTimeMillis()
         }
-        super.onDestroy()
+
+        try {
+            while (true) {
+                val cur = rec
+                val n = if (cur != null) cur.read(buf, 0, buf.size) else -1
+                lastReturnMs = System.currentTimeMillis()
+                if (n > 0) {
+                    out.write(buf, 0, n)  // pipa putus -> IOException -> keluar
+                    zeroSince = 0L
+                    readErrors = 0
+                    if (isSilent(buf, n)) {
+                        silentBytes += n
+                        val limit =
+                            if (lastReturnMs < quickUntilMs) quickLimitBytes else silentLimitBytes
+                        if (silentBytes >= limit) {
+                            silentBytes = 0L
+                            reopen()  // senyap: segarkan, siapa tahu sesi lama sudah mati
+                        }
+                    } else {
+                        silentBytes = 0L
+                    }
+                } else if (n == 0) {
+                    val now = System.currentTimeMillis()
+                    if (zeroSince == 0L) zeroSince = now
+                    val zeroLimit = if (now < quickUntilMs) QUICK_ZERO_MS else ZERO_REFRESH_MS
+                    if (now - zeroSince >= zeroLimit) {
+                        zeroSince = 0L
+                        reopen()
+                    } else {
+                        Thread.sleep(10)
+                    }
+                } else {
+                    // Error baca (mis. perekam dihentikan pengawas atau sistem): buat ulang.
+                    readErrors++
+                    Thread.sleep(50)
+                    reopen()
+                    if (openFails > 10 || readErrors > 40) {
+                        System.err.println("ERR:REMOTE_SUBMIX tidak bisa dipulihkan (error $n)")
+                        break
+                    }
+                }
+            }
+        } catch (_: Throwable) {
+            // aplikasi sudah berhenti membaca: selesai
+        } finally {
+            closeRecord(rec)
+        }
+        exitProcess(0)
     }
 }
